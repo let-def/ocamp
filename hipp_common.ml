@@ -1,11 +1,19 @@
 open Utils
 
+(* Shared constants *)
+
+let signature        = "HIPP01"
+let signature_length = String.length signature
+let env_socket       = "HIPP_PATH"
+let env_key          = "HIPP_KEY"
+let env_binary       = "HIPP"
+
 (* Simple engine using unix and shell as backend *)
 
+(** Record the output of a process (stdout and exit status) to replay it later
+    or concurrently *)
 module Result = struct
   type status = Unix.process_status
-  type hash = unit
-  type digest = hash * status
 
   type chunks =
     | Chunk of string * chunks Lwt.t
@@ -64,15 +72,6 @@ module Result = struct
   let chunks t = t.chunks
   let exit_status t = t.exit_status
 
-  let rec digest (*ctx*) = function
-    | Chunk (s,next) ->
-      (*Sha1.update_string ctx s;*)
-      next >>= digest (*ctx*)
-    | Close status ->
-      (*let sha = Sha1.finalize ctx in*)
-      status >|= fun status -> (*sha,*) (), status
-  let digest result = result.chunks >>= digest (*(Sha1.init ())*)
-
   let rec dump_chunks output = function
     | Chunk ("",next) -> next >>= dump_chunks output
     | Chunk (s,next) ->
@@ -83,60 +82,68 @@ module Result = struct
   let dump_to output {chunks} = chunks >>= dump_chunks output
 end
 
-type command = {
-  exec_dir: string;
-  exec_args: string array
-}
-type hint = string list
-
+(* We need to keep some context associated with unix processes.
+   To carry this information through user scripts, we use an environment
+   variable.
+   The Builder structure gives a unique string key to arbitrary ocaml values,
+   and allows to retrieve the value of a key while the associated lwt process
+   is alive. *)
 module Builder : sig
-  type t = ?hint:hint -> command -> Result.t Lwt.t
+  type 'a t
   type key = string
 
-  val with_builder : t -> ?on_release:(unit -> unit Lwt.t) -> (key -> 'a Lwt.t) -> 'a Lwt.t
-  val with_key : key -> (t option -> 'a Lwt.t) -> 'a Lwt.t
+  val create : unit -> 'a t
+  val with_key : 'a t -> key -> ('a option -> 'b Lwt.t) -> 'b Lwt.t
+  val with_value : 'a t -> 'a -> ?on_release:('a -> unit Lwt.t) -> (key -> 'b Lwt.t) -> 'b Lwt.t
 end = struct
-  type t = ?hint:hint -> command -> Result.t Lwt.t
   type key = string
-  type cell = t * int ref * (unit -> unit Lwt.t)
-  let keys : (string, cell) Hashtbl.t = Hashtbl.create 7
+  type 'a cell = 'a * int ref * ('a -> unit Lwt.t) option
+  type 'a t = (string, 'a cell) Hashtbl.t
+
+  let create () : 'a t = Hashtbl.create 7
+
   let fresh_key =
     let counter = ref 0 in
     fun () -> incr counter; string_of_int !counter
 
-  let get key =
-    try Some (Hashtbl.find keys key)
+  let get builder key =
+    try Some (Hashtbl.find builder key)
     with Not_found -> None
 
-  let decr_cell (_,counter,release_action) key () =
+  let decr_cell builder (a,counter,release_action) key () =
     decr counter;
     if !counter = 0 then
       begin
-        Hashtbl.remove keys key;
-        Lwt.async release_action
+        Hashtbl.remove builder key;
+        match release_action with
+        | None -> ()
+        | Some f -> Lwt.async (fun () -> f a)
       end;
     Lwt.return_unit
 
-  let with_key key f =
-    match get key with
+  let with_key builder key f =
+    match get builder key with
     | Some (t, counter, _ as cell) ->
       incr counter;
       Lwt.finalize
         (fun () -> f (Some t))
-        (decr_cell cell key)
+        (decr_cell builder cell key)
     | None -> f None
 
-  let with_builder builder ?(on_release=Lwt.return) f =
+  let with_value builder value ?on_release f =
     let key = fresh_key () in
-    let cell = (builder, ref 1, on_release) in
-    Hashtbl.add keys key cell;
+    let cell = (value, ref 1, on_release) in
+    Hashtbl.add builder key cell;
     Lwt.finalize
       (fun () -> f key)
-      (decr_cell cell key)
+      (decr_cell builder cell key)
 end
 
 module Command = struct
-  type t = command
+  type t = {
+    exec_dir: string;
+    exec_args: string array
+  }
 
   let compare (a : t) b = compare a b
 
@@ -181,8 +188,6 @@ module Command = struct
     output: Lwt_io.output_channel;
   }
 
-  let signature = "HIPP01"
-
   let unexpected_error fn exn =
     prerr_endline ("Unexpected error in " ^ fn);
     prerr_endline (Printexc.to_string exn)
@@ -210,7 +215,7 @@ module Command = struct
     let io_vector n =
       let iov_buffer = String.make n '_' in
       { Lwt_unix. iov_buffer; iov_offset = 0; iov_length = n } in
-    let header = io_vector (String.length signature) in
+    let header = io_vector signature_length in
     let fd_desc = [io_vector 1; io_vector 1; io_vector 1] in
     let io_vectors = header :: fd_desc in
     let sz = List.fold_left (fun s v -> s + v.Lwt_unix.iov_length) 0 io_vectors in

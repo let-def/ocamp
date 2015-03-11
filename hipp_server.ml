@@ -4,21 +4,26 @@ open Hipp_common
 module Make ( ) =
 struct
 
+  let keys : (?hint:unit -> Command.t -> Result.t Lwt.t) Builder.t =
+    Builder.create ()
+
+  (* Server loop, waiting for clients on unix socket *)
   module Runner = struct
     let server_path =
       Path.canonicalize (".hipp." ^ string_of_int (Unix.getpid ()))
+    let () = at_exit (fun () -> Unix.unlink server_path)
 
     let server_socket = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0
 
     let () =
       Lwt_unix.set_close_on_exec server_socket;
-      begin try Unix.unlink server_path
-      with _ -> ()
+      begin
+        try Unix.unlink server_path
+        with _ -> ()
       end;
       Lwt_unix.bind server_socket (Lwt_unix.ADDR_UNIX server_path);
       Lwt_unix.listen server_socket 0;
-      at_exit (fun () -> Unix.unlink server_path);
-      Unix.putenv "HIPP_PATH" server_path
+      Unix.putenv env_socket server_path
 
     let handle_client (fd,_addr) =
       let open Command in
@@ -32,9 +37,9 @@ struct
       Lwt.finalize
         begin fun () ->
           let query = command.query in
-          Builder.with_key query.key @@ function
+          Builder.with_key keys query.key @@ function
           | None ->
-            write_string "HIPP_KEY is not valid" !(command.env.stderr)
+            write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
             builder query.request >>= fun result ->
             Result.dump_to !(command.env.stdout) result >>= fun status ->
@@ -57,25 +62,26 @@ struct
     let compare_command = Command.compare
     let print_command = Command.to_string
 
-    type hint = string list
+    type hint = unit
     type result = Result.t
 
-    let do_execute ?(hint=[]) ~key {exec_dir; exec_args} =
-      let vars = Array.of_list (("HIPP_KEY=" ^ key) :: hint) in
+    let do_execute ?hint ~key {Command. exec_dir; exec_args} =
+      let vars = Array.of_list ["HIPP_KEY=" ^ key] in
       let env = Array.append vars (Unix.environment ()) in
       (* Lwt_process don't allow specifying working directory ?! *)
       Unix.chdir exec_dir;
       let command = (exec_args.(0), exec_args) in
       let process = Lwt_process.open_process_in ~env command in
       let result = Result.of_process process in
-      Lwt.async (fun () -> Builder.with_key key (fun _ -> Result.exit_status result));
+      Lwt.async (fun () -> Builder.with_key keys
+                    key (fun _ -> Result.exit_status result));
       result
 
     let execute ~build ?cached ?hint command =
       match cached with
       | Some result -> Lwt.return result
       | None ->
-        Builder.with_builder build @@ fun key ->
+        Builder.with_value keys build @@ fun key ->
         Lwt.return (do_execute ~key ?hint command)
   end
 
@@ -86,12 +92,13 @@ struct
 
   module Hipp = Hipp_engine.Make (Backend)(DontResume)
 
+  let join a = a >>= fun x -> x
+
   let main command  =
     let binary = Path.canonicalize Sys.executable_name in
-    Unix.putenv "HIPP" binary;
+    Unix.putenv env_binary binary;
     Hipp.build command >>= fun result ->
-    Result.dump_to (Some Lwt_unix.stdout) result >>= fun exit_status ->
-    exit_status >>= fun status ->
+    join (Result.dump_to (Some Lwt_unix.stdout) result) >>= fun status ->
     begin match status with
       | Unix.WEXITED n ->
         prerr_endline ("-- exited with status " ^ string_of_int n)
@@ -106,20 +113,14 @@ end
 (* Command line interface *)
 open Cmdliner
 
-let main command =
-  let module M = Make () in
-  let status = Lwt_main.run (M.main command) in
-  List.iter
-    (function
-    | Unix.WEXITED 0 -> ()
-    | Unix.WEXITED n -> exit n
-    | _ -> exit (-1))
-    [status]
-
 let command_exec input arguments =
   let exec_dir = Path.canonicalize "." in
   let exec_args = Array.of_list arguments in
-  main {exec_dir; exec_args}
+  let module M = Make () in
+  match Lwt_main.run (M.main {Command. exec_dir; exec_args}) with
+  | Unix.WEXITED 0 -> ()
+  | Unix.WEXITED n -> exit n
+  | _ -> exit (-1)
 
 let command_exec =
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
@@ -136,4 +137,5 @@ let commands = [command_exec]
 
 let main () =
   match Term.eval command_exec with
-  | `Error _ -> exit 1 | _ -> exit 0
+  | `Error _ -> exit 1
+  | _ -> exit 0
