@@ -50,30 +50,8 @@ module Path = struct
     flatten (List.rev (List.fold_left goup [] parts))
 
   let mtime filename =
-    let open Lwt_unix in
     Lwt.catch
-      (fun () -> Lwt.map (fun st -> st.st_mtime) (stat filename))
+      (fun () -> Lwt.map (fun st -> st.Lwt_unix.st_mtime)
+          (Lwt_unix.stat filename))
       (fun _exn -> Lwt.return nan)
 end
-
-(*module Pool : sig
-  type 'a t
-  val with_item : 'a t -> ('a -> 'b Lwt.t) -> 'b Lwt.t
-  val without_item : 'a t -> 'a -> (unit -> 'b Lwt.t) -> 'b Lwt.t
-
-  val fresh : ?parent:'a t -> (unit -> 'a option Lwt.t) -> 'a t
-end = struct
-  type 'a t = {
-    create : unit -> 'a option Lwt.t;
-    mutable ready : 'a list;
-    parent : 'a t option;
-  }
-
-  let fresh ?parent create =
-    { parent; create; ready = [] }
-
-
-  let with_item : 'a t -> ('a -> 'b Lwt.t) -> 'b Lwt.t
-  let without_item : 'a t -> 'a -> (unit -> 'b Lwt.t) -> 'b Lwt.t
-
-end*)

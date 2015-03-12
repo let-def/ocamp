@@ -20,34 +20,47 @@ module Make ( ) = struct
         invalid_arg ("Client.connect_server: no " ^ env_socket ^ " in environment")
     in
     let socket = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0 in
-    Lwt.catch (fun () ->
-      Lwt_unix.connect socket (Lwt_unix.ADDR_UNIX path) >>= fun () ->
-      let io_vector s =
-        { Lwt_unix. iov_buffer = s; iov_offset = 0; iov_length = String.length s } in
-      let io_vectors = List.map io_vector [signature;"i";"o";"e"] in
-      let fds = [Unix.stdin; Unix.stdout; Unix.stderr] in
-      Lwt_unix.send_msg ~socket ~io_vectors ~fds >>= fun _wrote -> (* FIXME *)
-      Lwt.return socket)
+    Lwt.catch
+      (fun () ->
+         Lwt_unix.connect socket (Lwt_unix.ADDR_UNIX path) >>= fun () ->
+         let io_vector s =
+           { Lwt_unix. iov_buffer = s; iov_offset = 0; iov_length = String.length s } in
+         let io_vectors = List.map io_vector [signature;"i";"o";"e"] in
+         let fds = [Unix.stdin; Unix.stdout; Unix.stderr] in
+         Lwt_unix.send_msg ~socket ~io_vectors ~fds >>= fun _wrote -> (* FIXME *)
+         Lwt.return socket)
       (fun exn -> Lwt_unix.close socket >>= fun () -> Lwt.fail exn)
 
   let execute_command (query : Command.query) =
-    connect_server () >>= fun socket ->
-    let input = Lwt_io.of_fd ~close:Lwt.return ~mode:Lwt_io.input socket in
-    let output = Lwt_io.of_fd ~close:Lwt.return ~mode:Lwt_io.output socket in
-    Lwt_io.write_value output query >>= fun () ->
-    Lwt_io.flush output >>= fun () ->
-    Lwt_io.read_value input >>= fun (status : Unix.process_status) ->
-    Lwt.join [Lwt_io.close input; Lwt_io.close output] >>= fun () ->
-    Lwt_unix.close socket >>= fun () ->
-    Lwt.return status
+    Lwt.catch (fun () ->
+        connect_server () >>= fun socket ->
+        let input = Lwt_io.of_fd ~close:Lwt.return ~mode:Lwt_io.input socket in
+        let output = Lwt_io.of_fd ~close:Lwt.return ~mode:Lwt_io.output socket in
+        Lwt_io.write_value output query >>= fun () ->
+        Lwt_io.flush output >>= fun () ->
+        Lwt_io.read_value input >>= fun (status : Unix.process_status) ->
+        Lwt.join [Lwt_io.close input; Lwt_io.close output] >>= fun () ->
+        Lwt_unix.close socket >>= fun () ->
+        Lwt.return (Some status)
+      )
+      (function
+        | Unix.Unix_error (Unix.ENOENT, "connect", "") ->
+          prerr_endline "--- cannot connect to server";
+          Lwt.return_none
+        | End_of_file ->
+          prerr_endline "--- build error, server closed connection";
+          Lwt.return_none
+        | exn -> Lwt.fail exn)
+
 
   let main ?env actions =
     let query = make_query ?env actions in
     let status = Lwt_main.run (execute_command query) in
     exit (match status with
-          | Unix.WEXITED n -> n
-          | Unix.WSIGNALED n -> (-1)
-          | Unix.WSTOPPED n -> (-1))
+        | None -> (-1)
+        | Some (Unix.WEXITED n) -> n
+        | Some (Unix.WSIGNALED n) -> (-1)
+        | Some (Unix.WSTOPPED n) -> (-1))
 end
 
 let main ?env actions =

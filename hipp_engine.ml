@@ -26,7 +26,7 @@ module Make
   :
 sig
   module CommandMap : Map.S with type key = S.command
-  exception Cycle of S.command list
+  exception Cycle of S.command * S.command list
 
   val state : unit -> S.result CommandMap.t
   val build : ?hint:S.hint -> S.command -> S.result Lwt.t
@@ -39,7 +39,15 @@ end = struct
   module CommandSet = Set.Make(Command)
   module CommandMap = Map.Make(Command)
 
-  exception Cycle of S.command list
+  exception Cycle of S.command * S.command list
+  let () = Printexc.register_printer (function
+      | Cycle (cmd,cmds) ->
+        Some (
+          "Build cycle:\n" ^
+          S.print_command cmd ^ " is required by: " ^
+          String.concat "\n - " ("" :: List.map S.print_command cmds))
+      | _ -> None)
+
   module Trace = struct
     type t = CommandSet.t * S.command list
     let add target (set,targets) =
@@ -49,7 +57,7 @@ end = struct
             target' :: acc
           | target' :: rest -> deps (target' :: acc) rest
           | [] -> assert false in
-        raise (Cycle (deps [] targets))
+        raise (Cycle (target, deps [] targets))
       else
         (CommandSet.add target set, target :: targets)
 
