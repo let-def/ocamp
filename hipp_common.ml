@@ -10,135 +10,6 @@ let env_binary       = "HIPP"
 
 (* Simple engine using unix and shell as backend *)
 
-(** Record the output of a process (stdout and exit status) to replay it later
-    or concurrently *)
-module Result = struct
-  type status = Unix.process_status
-
-  type chunks =
-    | Chunk of string * chunks Lwt.t
-    | Close of status Lwt.t
-
-  type t = {
-    mutable chunks: chunks Lwt.t;
-    exit_status: status Lwt.t;
-  }
-
-  let rec pack buffer = function
-    | Chunk (s, next) ->
-      Buffer.add_string buffer s;
-      if Buffer.length buffer >= 4096 then
-        let s = Buffer.contents buffer in
-        Buffer.clear buffer;
-        Lwt.return (Chunk (s, next >>= pack buffer))
-      else
-        next >>= pack buffer
-    | Close status ->
-      let s = Buffer.contents buffer in
-      if s = "" then
-        Lwt.return (Close status)
-      else
-        Lwt.return (Chunk (s, Lwt.return (Close status)))
-  let pack chunks = pack (Buffer.create 4096) chunks
-
-  let of_chunks ?(packed=true) chunks =
-    let rec exit_status = function
-      | Chunk (_,next) -> next >>= exit_status
-      | Close status -> status in
-    let result = { chunks; exit_status = chunks >>= exit_status } in
-    let pack () =
-      result.exit_status >|= fun _ ->
-        result.chunks >|= fun chunks ->
-          result.chunks <- pack chunks in
-    if packed then Lwt.async pack;
-    result
-
-  let of_status status =
-    of_chunks ~packed:false (Lwt.return (Close status))
-
-  let none = of_status (Lwt.return (Unix.WEXITED 255))
-  let ok = of_status (Lwt.return (Unix.WEXITED 0))
-
-  let of_process p =
-    let buffer = Bytes.to_string (Bytes.create 1024) in
-    let rec aux () =
-      Lwt_io.read_into p#stdout buffer 0 1024 >>= fun got ->
-      if got = 0 then
-        Lwt.return (Close p#close)
-      else
-        Lwt.return (Chunk (String.sub buffer 0 got, aux ())) in
-    of_chunks ~packed:true (aux ())
-
-  let chunks t = t.chunks
-  let exit_status t = t.exit_status
-
-  let rec dump_chunks output = function
-    | Chunk ("",next) -> next >>= dump_chunks output
-    | Chunk (s,next) ->
-      write_string s output >>= fun () ->
-      next >>= dump_chunks output
-    | Close exit_status -> Lwt.return exit_status
-
-  let dump_to output {chunks} = chunks >>= dump_chunks output
-end
-
-(* We need to keep some context associated with unix processes.
-   To carry this information through user scripts, we use an environment
-   variable.
-   The Builder structure gives a unique string key to arbitrary ocaml values,
-   and allows to retrieve the value of a key while the associated lwt process
-   is alive. *)
-module Builder : sig
-  type 'a t
-  type key = string
-
-  val create : unit -> 'a t
-  val with_key : 'a t -> key -> ('a option -> 'b Lwt.t) -> 'b Lwt.t
-  val with_value : 'a t -> 'a -> ?on_release:('a -> unit Lwt.t) -> (key -> 'b Lwt.t) -> 'b Lwt.t
-end = struct
-  type key = string
-  type 'a cell = 'a * int ref * ('a -> unit Lwt.t) option
-  type 'a t = (string, 'a cell) Hashtbl.t
-
-  let create () : 'a t = Hashtbl.create 7
-
-  let fresh_key =
-    let counter = ref 0 in
-    fun () -> incr counter; string_of_int !counter
-
-  let get builder key =
-    try Some (Hashtbl.find builder key)
-    with Not_found -> None
-
-  let decr_cell builder (a,counter,release_action) key () =
-    decr counter;
-    if !counter = 0 then
-      begin
-        Hashtbl.remove builder key;
-        match release_action with
-        | None -> ()
-        | Some f -> Lwt.async (fun () -> f a)
-      end;
-    Lwt.return_unit
-
-  let with_key builder key f =
-    match get builder key with
-    | Some (t, counter, _ as cell) ->
-      incr counter;
-      Lwt.finalize
-        (fun () -> f (Some t))
-        (decr_cell builder cell key)
-    | None -> f None
-
-  let with_value builder value ?on_release f =
-    let key = fresh_key () in
-    let cell = (value, ref 1, on_release) in
-    Hashtbl.add builder key cell;
-    Lwt.finalize
-      (fun () -> f key)
-      (decr_cell builder cell key)
-end
-
 module Command = struct
   type t = {
     exec_dir: string;
@@ -252,4 +123,133 @@ module Command = struct
         >>= fun () -> fail exn)
 end
 
+
+(** Record the output of a process (stdout and exit status) to replay it later
+    or concurrently *)
+module Result = struct
+  type status = Command.t list * Unix.process_status
+
+  type chunks =
+    | Chunk of string * chunks Lwt.t
+    | Close of status Lwt.t
+
+  type t = {
+    mutable chunks: chunks Lwt.t;
+    exit_status: status Lwt.t;
+  }
+
+  let rec pack buffer = function
+    | Chunk (s, next) ->
+      Buffer.add_string buffer s;
+      if Buffer.length buffer >= 4096 then
+        let s = Buffer.contents buffer in
+        Buffer.clear buffer;
+        Lwt.return (Chunk (s, next >>= pack buffer))
+      else
+        next >>= pack buffer
+    | Close status ->
+      let s = Buffer.contents buffer in
+      if s = "" then
+        Lwt.return (Close status)
+      else
+        Lwt.return (Chunk (s, Lwt.return (Close status)))
+  let pack chunks = pack (Buffer.create 4096) chunks
+
+  let of_chunks ?(packed=true) chunks =
+    let rec exit_status = function
+      | Chunk (_,next) -> next >>= exit_status
+      | Close status -> status in
+    let result = { chunks; exit_status = chunks >>= exit_status } in
+    let pack () =
+      result.exit_status >|= fun _ ->
+        result.chunks >|= fun chunks ->
+          result.chunks <- pack chunks in
+    if packed then Lwt.async pack;
+    result
+
+  let of_status status =
+    of_chunks ~packed:false (Lwt.return (Close status))
+
+  let none = of_status (Lwt.return ([], Unix.WEXITED 255))
+  let ok = of_status (Lwt.return ([], Unix.WEXITED 0))
+
+  let of_process deps p =
+    let buffer = Bytes.to_string (Bytes.create 1024) in
+    let rec aux () =
+      Lwt_io.read_into p#stdout buffer 0 1024 >>= fun got ->
+      if got = 0 then
+        Lwt.return (Close (Lwt.map (fun status -> !deps, status) p#close))
+      else
+        Lwt.return (Chunk (String.sub buffer 0 got, aux ())) in
+    of_chunks ~packed:true (aux ())
+
+  let chunks t = t.chunks
+  let exit_status t = t.exit_status
+
+  let rec dump_chunks output = function
+    | Chunk ("",next) -> next >>= dump_chunks output
+    | Chunk (s,next) ->
+      write_string s output >>= fun () ->
+      next >>= dump_chunks output
+    | Close exit_status -> Lwt.return exit_status
+
+  let dump_to output {chunks} = chunks >>= dump_chunks output
+end
+
+(* We need to keep some context associated with unix processes.
+   To carry this information through user scripts, we use an environment
+   variable.
+   The Builder structure gives a unique string key to arbitrary ocaml values,
+   and allows to retrieve the value of a key while the associated lwt process
+   is alive. *)
+module Builder : sig
+  type 'a t
+  type key = string
+
+  val create : unit -> 'a t
+  val with_key : 'a t -> key -> ('a option -> 'b Lwt.t) -> 'b Lwt.t
+  val with_value : 'a t -> 'a -> ?on_release:('a -> unit Lwt.t) -> (key -> 'b Lwt.t) -> 'b Lwt.t
+end = struct
+  type key = string
+  type 'a cell = 'a * int ref * ('a -> unit Lwt.t) option
+  type 'a t = (string, 'a cell) Hashtbl.t
+
+  let create () : 'a t = Hashtbl.create 7
+
+  let fresh_key =
+    let counter = ref 0 in
+    fun () -> incr counter; string_of_int !counter
+
+  let get builder key =
+    try Some (Hashtbl.find builder key)
+    with Not_found -> None
+
+  let decr_cell builder (a,counter,release_action) key () =
+    decr counter;
+    if !counter = 0 then
+      begin
+        Hashtbl.remove builder key;
+        match release_action with
+        | None -> ()
+        | Some f -> Lwt.async (fun () -> f a)
+      end;
+    Lwt.return_unit
+
+  let with_key builder key f =
+    match get builder key with
+    | Some (t, counter, _ as cell) ->
+      incr counter;
+      Lwt.finalize
+        (fun () -> f (Some t))
+        (decr_cell builder cell key)
+    | None -> f None
+
+  let with_value builder value ?on_release f =
+    let key = fresh_key () in
+    let cell = (value, ref 1, on_release) in
+    Hashtbl.add builder key cell;
+    Lwt.finalize
+      (fun () -> f key)
+      (decr_cell builder cell key)
+end
 

@@ -22,6 +22,7 @@ module Make
   :
   sig
     module CommandMap : Map.S with type key = S.command
+    exception Cycle of S.command * S.command list
     val state : unit -> S.result CommandMap.t
     val build : ?hint:S.hint -> S.command -> S.result Lwt.t
   end

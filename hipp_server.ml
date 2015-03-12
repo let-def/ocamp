@@ -4,7 +4,12 @@ open Hipp_common
 module Make ( ) =
 struct
 
-  let keys : (?hint:unit -> Command.t -> Result.t Lwt.t) Builder.t =
+  type builder = {
+    build_func : ?hint:unit -> Command.t -> Result.t Lwt.t;
+    build_deps : Command.t list ref;
+  }
+
+  let builders : builder Builder.t =
     Builder.create ()
 
   (* Server loop, waiting for clients on unix socket *)
@@ -37,11 +42,12 @@ struct
       Lwt.finalize
         begin fun () ->
           let query = command.query in
-          Builder.with_key keys query.key @@ function
+          Builder.with_key builders query.key @@ function
           | None ->
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
-            builder query.request >>= fun result ->
+            builder.build_deps := query.request :: !(builder.build_deps);
+            builder.build_func query.request >>= fun result ->
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
             status >>= fun status ->
@@ -65,15 +71,15 @@ struct
     type hint = unit
     type result = Result.t
 
-    let do_execute ?hint ~key {Command. exec_dir; exec_args} =
+    let do_execute ?hint ~key deps {Command. exec_dir; exec_args} =
       let vars = Array.of_list ["HIPP_KEY=" ^ key] in
       let env = Array.append vars (Unix.environment ()) in
       (* Lwt_process don't allow specifying working directory ?! *)
       Unix.chdir exec_dir;
       let command = (exec_args.(0), exec_args) in
       let process = Lwt_process.open_process_in ~env command in
-      let result = Result.of_process process in
-      Lwt.async (fun () -> Builder.with_key keys
+      let result = Result.of_process deps process in
+      Lwt.async (fun () -> Builder.with_key builders
                     key (fun _ -> Result.exit_status result));
       result
 
@@ -81,8 +87,12 @@ struct
       match cached with
       | Some result -> Lwt.return result
       | None ->
-        Builder.with_value keys build @@ fun key ->
-        Lwt.return (do_execute ~key ?hint command)
+        let builder = {
+          build_func = build;
+          build_deps = ref [];
+        } in
+        Builder.with_value builders builder @@ fun key ->
+        Lwt.return (do_execute ~key ?hint builder.build_deps command)
   end
 
   (* Empty database *)
@@ -100,11 +110,11 @@ struct
     Hipp.build command >>= fun result ->
     join (Result.dump_to (Some Lwt_unix.stdout) result) >>= fun status ->
     begin match status with
-      | Unix.WEXITED n ->
+      | _, Unix.WEXITED n ->
         prerr_endline ("-- exited with status " ^ string_of_int n)
-      | Unix.WSIGNALED n ->
+      | _, Unix.WSIGNALED n ->
         prerr_endline ("-- killed by signal " ^ string_of_int n)
-      | Unix.WSTOPPED n ->
+      | _, Unix.WSTOPPED n ->
         prerr_endline ("-- stopped by signal " ^ string_of_int n)
     end;
     Lwt.return status
@@ -118,9 +128,14 @@ let command_exec input arguments =
   let exec_args = Array.of_list arguments in
   let module M = Make () in
   match Lwt_main.run (M.main {Command. exec_dir; exec_args}) with
-  | Unix.WEXITED 0 -> ()
-  | Unix.WEXITED n -> exit n
+  | _, Unix.WEXITED 0 -> ()
+  | _, Unix.WEXITED n -> exit n
   | _ -> exit (-1)
+  | exception M.Hipp.Cycle (cmd,cmds) ->
+    let p = M.Backend.print_command in
+    Printf.eprintf "Cycle detected: %s\n"
+      (String.concat "\nis required by " (p cmd :: List.rev_map p cmds));
+    exit (-1)
 
 let command_exec =
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
