@@ -10,6 +10,11 @@ module type Spec = sig
   type hint
   type result
 
+  val cached
+    :  build:(?hint:hint -> command -> result Lwt.t)
+    -> command
+    -> result option Lwt.t
+
   val execute
     :  build:(?hint:hint -> command -> result Lwt.t)
     -> ?cached:result
@@ -21,8 +26,6 @@ end
 module Make
     (* Specification of the build backend *)
     (S : Spec)
-    (* State to resume from *)
-    (DB : sig val cached : S.command -> S.result option Lwt.t end)
   :
 sig
   module CommandMap : Map.S with type key = S.command
@@ -70,7 +73,7 @@ end = struct
   let rec rebuild ?hint ~trace target () =
     assert (not (CommandMap.mem target !result_database));
     let build = build ~trace in
-    DB.cached target >>= fun cached ->
+    S.cached ~build target >>= fun cached ->
     S.execute ~build ?cached ?hint target >|= fun result ->
     result_database := CommandMap.add target result !result_database;
     result

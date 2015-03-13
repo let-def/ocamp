@@ -138,6 +138,47 @@ module Result = struct
     exit_status: status Lwt.t;
   }
 
+  let equal_status t1 t2 =
+    t1 >>= fun t1 -> t2 >|= fun t2 -> t1 = t2
+
+  let equal_prefix p1 s1 p2 s2 =
+    let l1 = String.length s1 - p1 and l2 = String.length s2 - p2 in
+    try
+      for i = 0 to min l1 l2 do
+        if s1.[i] <> s2.[i] then
+          raise Not_found
+      done;
+      if l1 = l2
+      then `Equal
+      else if l2 < l1
+      then `S1 (p1 + l2)
+      else `S2 (p2 + l1)
+    with Not_found -> `Diff
+
+  let rec equal_chunks p1 t1 p2 t2 = match t1, t2 with
+    | Close t1, Close t2 -> equal_status t1 t2
+    | Chunk ("",t1'), t2 ->
+      t1' >>= fun t1 -> equal_chunks 0 t1 p2 t2
+    | t1, Chunk ("",t2') ->
+      t2' >>= fun t2 -> equal_chunks p1 t1 0 t2
+    | Chunk (s1,t1'), Chunk (s2,t2') ->
+      begin match equal_prefix p1 s1 p2 s2 with
+        | `Equal ->
+          t1' >>= fun t1 -> t2' >>= fun t2 ->
+          equal_chunks 0 t1 0 t2
+        | `S1 p1 ->
+          t2' >>= fun t2 -> equal_chunks p1 t1 0 t2
+        | `S2 p2 ->
+          t1' >>= fun t1 -> equal_chunks 0 t1 p2 t2
+        | `Diff -> Lwt.return_false
+      end
+    | _ -> Lwt.return_false
+
+  let equal t1 t2 =
+    t1.chunks >>= fun t1 ->
+    t2.chunks >>= fun t2 ->
+    equal_chunks 0 t1 0 t2
+
   let rec pack buffer = function
     | Chunk (s, next) ->
       Buffer.add_string buffer s;

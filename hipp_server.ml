@@ -1,7 +1,9 @@
 open Utils
 open Hipp_common
 
-module Make ( ) =
+module Make (P : sig
+               val cache : (Command.t, Result.t) Hashtbl.t
+             end) =
 struct
 
   type builder = {
@@ -71,6 +73,33 @@ struct
     type hint = unit
     type result = Result.t
 
+    let rec verify first ~(build: ?hint:hint -> command -> result Lwt.t) command =
+      print_endline ("-- checking " ^ print_command command);
+      match Hashtbl.find P.cache command with
+      | result ->
+        result.Result.exit_status >>= begin function
+          | ([],_) when first ->
+            Lwt.return_none
+          | ([],_) ->
+            build command >>= fun result' ->
+            Result.equal result result' >>= fun equal ->
+            if equal then
+              Lwt.return (Some result)
+            else
+              Lwt.return_none
+          | (deps,_) ->
+            Lwt_list.exists_p (fun cmd ->
+                verify false ~build cmd >|= function
+                | None -> true
+                | Some _ -> false)
+              deps
+            >|= fun b -> if b then Some result else None
+        end
+      | exception Not_found -> Lwt.return_none
+
+    let cached ~build command =
+      verify true ~build command
+
     let do_execute ?hint ~key deps {Command. exec_dir; exec_args} =
       let vars = Array.of_list ["HIPP_KEY=" ^ key] in
       let env = Array.append vars (Unix.environment ()) in
@@ -95,16 +124,11 @@ struct
         Lwt.return (do_execute ~key ?hint builder.build_deps command)
   end
 
-  (* Empty database *)
-  module DontResume = struct
-    let cached _ = Lwt.return_none
-  end
-
-  module Hipp = Hipp_engine.Make (Backend)(DontResume)
+  module Hipp = Hipp_engine.Make (Backend)
 
   let join a = a >>= fun x -> x
 
-  let main command  =
+  let main command =
     let binary = Path.canonicalize Sys.executable_name in
     Unix.putenv env_binary binary;
     Hipp.build command >>= fun result ->
@@ -123,12 +147,16 @@ end
 (* Command line interface *)
 open Cmdliner
 
-let command_exec input arguments =
+let rec command_exec
+    ?(cache = (Hashtbl.create 7 : (Command.t, Result.t) Hashtbl.t))
+    input arguments =
   let exec_dir = Path.canonicalize "." in
   let exec_args = Array.of_list arguments in
-  let module M = Make () in
+  let module M = Make (struct let cache = cache end) in
   match Lwt_main.run (M.main {Command. exec_dir; exec_args}) with
-  | _, Unix.WEXITED 0 -> ()
+  | _, Unix.WEXITED 0 ->
+    ignore (read_line ());
+    command_exec ~cache:(M.Hipp.state ()) input arguments
   | _, Unix.WEXITED n -> exit n
   | _ -> exit (-1)
   | exception M.Hipp.Cycle (cmd,cmds) ->
@@ -136,6 +164,8 @@ let command_exec input arguments =
     Printf.eprintf "Cycle detected: %s\n"
       (String.concat "\nis required by " (p cmd :: List.rev_map p cmds));
     exit (-1)
+
+let command_exec input arguments = command_exec input arguments
 
 let command_exec =
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
