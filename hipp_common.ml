@@ -141,9 +141,44 @@ module Result = struct
     | Close of status Lwt.t
 
   type t = {
+    heart: Heart.t;
     mutable chunks: chunks Lwt.t;
     exit_status: status Lwt.t;
   }
+
+  let rec pack buffer = function
+    | Chunk (s, next) ->
+      Buffer.add_string buffer s;
+      if Buffer.length buffer >= 4096 then
+        let s = Buffer.contents buffer in
+        Buffer.clear buffer;
+        Lwt.return (Chunk (s, next >>= pack buffer))
+      else
+        next >>= pack buffer
+    | Close status ->
+      let s = Buffer.contents buffer in
+      if s = "" then
+        Lwt.return (Close status)
+      else
+        Lwt.return (Chunk (s, Lwt.return (Close status)))
+  let pack chunks = pack (Buffer.create 4096) chunks
+
+  let fresh () =
+    let chunks, chunksu = Lwt.wait () in
+    let rec exit_status = function
+      | Chunk (_,next) -> next >>= exit_status
+      | Close status -> status in
+    let exit_status = chunks >>= exit_status in
+    let result = { heart = Heart.fresh (); chunks; exit_status } in
+    result, (fun ?(packed=true) chunks ->
+        let pack () =
+          result.exit_status >|= fun _ ->
+          chunks >|= fun chunks ->
+          result.chunks <- pack chunks in
+        if packed then Lwt.async pack;
+        chunks >>= fun chunks ->
+        Lwt.wakeup_later chunksu chunks;
+        result.exit_status)
 
   let equal_status t1 t2 =
     t1 >>= fun t1 -> t2 >|= fun t2 -> t1 = t2
@@ -186,42 +221,13 @@ module Result = struct
     t2.chunks >>= fun t2 ->
     equal_chunks 0 t1 0 t2
 
-  let rec pack buffer = function
-    | Chunk (s, next) ->
-      Buffer.add_string buffer s;
-      if Buffer.length buffer >= 4096 then
-        let s = Buffer.contents buffer in
-        Buffer.clear buffer;
-        Lwt.return (Chunk (s, next >>= pack buffer))
-      else
-        next >>= pack buffer
-    | Close status ->
-      let s = Buffer.contents buffer in
-      if s = "" then
-        Lwt.return (Close status)
-      else
-        Lwt.return (Chunk (s, Lwt.return (Close status)))
-  let pack chunks = pack (Buffer.create 4096) chunks
-
-  let of_chunks ?(packed=true) chunks =
-    let rec exit_status = function
-      | Chunk (_,next) -> next >>= exit_status
-      | Close status -> status in
-    let result = { chunks; exit_status = chunks >>= exit_status } in
-    let pack () =
-      result.exit_status >|= fun _ ->
-        result.chunks >|= fun chunks ->
-          result.chunks <- pack chunks in
-    if packed then Lwt.async pack;
-    result
-
-  let of_status status =
-    of_chunks ~packed:false (Lwt.return (Close status))
+  let of_status status (f : ?packed:bool -> chunks Lwt.t -> status Lwt.t) =
+    f ~packed:false (Lwt.return (Close status))
 
   let none = of_status (Lwt.return ([], Unix.WEXITED 255))
   let ok = of_status (Lwt.return ([], Unix.WEXITED 0))
 
-  let of_process deps p =
+  let of_process deps p (f : ?packed:bool -> chunks Lwt.t -> status Lwt.t) =
     let buffer = Bytes.to_string (Bytes.create 1024) in
     let rec aux () =
       Lwt_io.read_into p#stdout buffer 0 1024 >>= fun got ->
@@ -229,7 +235,7 @@ module Result = struct
         Lwt.return (Close (Lwt.map (fun status -> !deps, status) p#close))
       else
         Lwt.return (Chunk (String.sub buffer 0 got, aux ())) in
-    of_chunks ~packed:true (aux ())
+    f ~packed:true (aux ())
 
   let chunks t = t.chunks
   let exit_status t = t.exit_status

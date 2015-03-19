@@ -1,10 +1,6 @@
 type t = { mutable deps: t list; mutable broken: bool }
-type glass = t
-
-type t and glass
 
 let fresh () = { deps = []; broken = false }
-let heart x = x
 
 let is_broken t = t.broken
 
@@ -20,10 +16,12 @@ let rec register_dep g = function
     register_dep g ts
 
 let fragilize g ts =
-  if List.exists is_broken ts then
-    break g
-  else
-    register_dep g ts
+  if not (is_broken g) then begin
+    if List.exists is_broken ts then
+      break g
+    else
+      register_dep g ts
+  end
 
 let broken = { deps = []; broken = true }
 

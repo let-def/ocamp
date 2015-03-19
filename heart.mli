@@ -1,11 +1,10 @@
-type t and glass
+type t
 
-val fresh : unit -> glass
-val heart : glass -> t
+val fresh : unit -> t
 
 val is_broken : t -> bool
-val break : glass -> unit
-val fragilize : glass -> t list -> unit
+val break : t -> unit
+val fragilize : t -> t list -> unit
 
 val broken : t
 val join : t list -> t

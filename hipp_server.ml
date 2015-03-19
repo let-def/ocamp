@@ -7,7 +7,7 @@ module Make (P : sig
 struct
 
   type builder = {
-    build_func : [`Hipp|`Stir] -> Command.t -> Result.t Lwt.t;
+    build_func : [`Hipp|`Stir] -> Command.t -> Result.t;
     build_deps : Command.t list ref;
   }
 
@@ -49,7 +49,7 @@ struct
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
             builder.build_deps := query.request :: !(builder.build_deps);
-            builder.build_func `Hipp query.request >>= fun result ->
+            let result = builder.build_func `Hipp query.request in
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
             status >>= fun status ->
@@ -114,14 +114,14 @@ struct
     let roots : CommandSet.t ref = ref CommandSet.empty*)
 
     (* Result cache *)
-    let cache : (bool ref * Result.t Lwt.t) CommandMap.t ref =
+    let cache : Result.t CommandMap.t ref =
       ref CommandMap.empty
 
     let update_cache command result =
-      cache := CommandMap.add command (ref true, result) !cache
+      cache := CommandMap.add command result !cache
 
-    let do_execute builder ({Command. exec_dir; exec_args } as command) =
-      let result, resultu = Lwt.wait () in
+    let do_execute builder command =
+      let result, resultf = Result.fresh () in
       update_cache command result;
       (* Lwt_process doesn't allow specifying working directory ?! *)
       Lwt.ignore_result
@@ -129,19 +129,17 @@ struct
           Builder.with_value builders builder @@ fun key ->
           let vars = Array.of_list [env_key ^ "=" ^ key] in
           let env = Array.append vars (Unix.environment ()) in
-          Unix.chdir exec_dir;
+          Unix.chdir command.Command.exec_dir;
           let process = Lwt_process.open_process_in ~env
-              (exec_args.(0), exec_args) in
-          let result = Result.of_process builder.build_deps process in
-          Lwt.wakeup_later resultu result;
+              (command.Command.exec_args.(0), command.Command.exec_args) in
           (* Wait for command to finish *)
-          Result.exit_status result
+          Result.of_process builder.build_deps process resultf;
         end;
       result
 
-    let is_fresh cell = function
-      | `Hipp -> !cell
-      | `Stir -> cell := false; false
+    let is_fresh result = function
+      | `Hipp -> not (Heart.is_broken result.Result.heart)
+      | `Stir -> Heart.break result.Result.heart; false
 
     let rec rebuild command =
       let builder = {
@@ -152,11 +150,10 @@ struct
 
     and build (action : [`Hipp|`Stir]) command =
       match CommandMap.find command !cache with
-      | (cell, result) ->
-        if is_fresh cell action then
-          result
-        else
-          rebuild command
+      | result ->
+        if is_fresh result action
+        then result
+        else rebuild command
       | exception Not_found ->
         rebuild command
   end
@@ -166,7 +163,7 @@ struct
   let main command =
     let binary = Path.canonicalize Sys.executable_name in
     Unix.putenv env_binary binary;
-    Backend.build `Hipp command >>= fun result ->
+    let result = Backend.build `Hipp command in
     join (Result.dump_to (Some Lwt_unix.stdout) result) >>= fun status ->
     begin match status with
       | _, Unix.WEXITED n ->
