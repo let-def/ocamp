@@ -2,12 +2,12 @@ open Utils
 open Hipp_common
 
 module Make (P : sig
-               val cache : (Command.t, Result.t) Hashtbl.t
+               val cache : Result.t CommandMap.t
              end) =
 struct
 
   type builder = {
-    build_func : ?hint:unit -> Command.t -> Result.t Lwt.t;
+    build_func : [`Hipp|`Stir] -> Command.t -> Result.t Lwt.t;
     build_deps : Command.t list ref;
   }
 
@@ -17,7 +17,7 @@ struct
   (* Server loop, waiting for clients on unix socket *)
   module Runner = struct
     let server_path =
-      Path.canonicalize (".hipp." ^ string_of_int (Unix.getpid ()))
+      Path.canonicalize (socket_name ^ string_of_int (Unix.getpid ()))
     let () = at_exit (fun () -> Unix.unlink server_path)
 
     let server_socket = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0
@@ -49,7 +49,7 @@ struct
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
             builder.build_deps := query.request :: !(builder.build_deps);
-            builder.build_func query.request >>= fun result ->
+            builder.build_func `Hipp query.request >>= fun result ->
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
             status >>= fun status ->
@@ -70,10 +70,9 @@ struct
     let compare_command = Command.compare
     let print_command = Command.to_string
 
-    type hint = unit
     type result = Result.t
 
-    let rec verify first ~(build: ?hint:hint -> command -> result Lwt.t) command =
+    (*let rec verify first ~(build: command -> result Lwt.t) command =
       print_endline ("-- checking " ^ print_command command);
       match Hashtbl.find P.cache command with
       | result ->
@@ -95,43 +94,79 @@ struct
               deps
             >|= fun b -> if b then Some result else None
         end
-      | exception Not_found -> Lwt.return_none
+      | exception Not_found -> Lwt.return_none*)
 
-    let cached ~build command =
-      verify true ~build command
+    (* Followers structure *)
 
-    let do_execute ?hint ~key deps {Command. exec_dir; exec_args} =
-      let vars = Array.of_list ["HIPP_KEY=" ^ key] in
-      let env = Array.append vars (Unix.environment ()) in
-      (* Lwt_process don't allow specifying working directory ?! *)
-      Unix.chdir exec_dir;
-      let command = (exec_args.(0), exec_args) in
-      let process = Lwt_process.open_process_in ~env command in
-      let result = Result.of_process deps process in
-      Lwt.async (fun () -> Builder.with_key builders
-                    key (fun _ -> Result.exit_status result));
+    (*type followers = { mutable followers: CommandSet.t; mutable workers : int }
+
+    let followed : followers CommandMap.t ref = ref CommandMap.empty
+    let update_followed command followers =
+      if CommandSet.is_empty followers.followers && followers.workers = 0 then
+        followed := CommandMap.remove command !followed
+      else if not (CommandMap.mem command !followed) then
+        followed := CommandMap.add command followers !followed
+
+    let update_followers command result' result =
+      let deps x = Lwt.catch (fun () -> Lwt.map Result.exit_status x) (fun
+      let before =
+
+    let roots : CommandSet.t ref = ref CommandSet.empty*)
+
+    (* Result cache *)
+    let cache : (bool ref * Result.t Lwt.t) CommandMap.t ref =
+      ref CommandMap.empty
+
+    let update_cache command result =
+      cache := CommandMap.add command (ref true, result) !cache
+
+    let do_execute builder ({Command. exec_dir; exec_args } as command) =
+      let result, resultu = Lwt.wait () in
+      update_cache command result;
+      (* Lwt_process doesn't allow specifying working directory ?! *)
+      Lwt.ignore_result
+        begin
+          Builder.with_value builders builder @@ fun key ->
+          let vars = Array.of_list [env_key ^ "=" ^ key] in
+          let env = Array.append vars (Unix.environment ()) in
+          Unix.chdir exec_dir;
+          let process = Lwt_process.open_process_in ~env
+              (exec_args.(0), exec_args) in
+          let result = Result.of_process builder.build_deps process in
+          Lwt.wakeup_later resultu result;
+          (* Wait for command to finish *)
+          Result.exit_status result
+        end;
       result
 
-    let execute ~build ?cached ?hint command =
-      match cached with
-      | Some result -> Lwt.return result
-      | None ->
-        let builder = {
-          build_func = build;
-          build_deps = ref [];
-        } in
-        Builder.with_value builders builder @@ fun key ->
-        Lwt.return (do_execute ~key ?hint builder.build_deps command)
-  end
+    let is_fresh cell = function
+      | `Hipp -> !cell
+      | `Stir -> cell := false; false
 
-  module Hipp = Hipp_engine.Make (Backend)
+    let rec rebuild command =
+      let builder = {
+        build_func = build;
+        build_deps = ref [];
+      } in
+      do_execute builder command
+
+    and build (action : [`Hipp|`Stir]) command =
+      match CommandMap.find command !cache with
+      | (cell, result) ->
+        if is_fresh cell action then
+          result
+        else
+          rebuild command
+      | exception Not_found ->
+        rebuild command
+  end
 
   let join a = a >>= fun x -> x
 
   let main command =
     let binary = Path.canonicalize Sys.executable_name in
     Unix.putenv env_binary binary;
-    Hipp.build command >>= fun result ->
+    Backend.build `Hipp command >>= fun result ->
     join (Result.dump_to (Some Lwt_unix.stdout) result) >>= fun status ->
     begin match status with
       | _, Unix.WEXITED n ->
@@ -147,25 +182,18 @@ end
 (* Command line interface *)
 open Cmdliner
 
-let rec command_exec
-    ?(cache = (Hashtbl.create 7 : (Command.t, Result.t) Hashtbl.t))
-    input arguments =
+let rec command_exec cache input arguments =
   let exec_dir = Path.canonicalize "." in
   let exec_args = Array.of_list arguments in
   let module M = Make (struct let cache = cache end) in
   match Lwt_main.run (M.main {Command. exec_dir; exec_args}) with
-  | _, Unix.WEXITED 0 ->
+  (*| _, Unix.WEXITED 0 ->
     ignore (read_line ());
-    command_exec ~cache:(M.Hipp.state ()) input arguments
+    command_exec cache input arguments*)
   | _, Unix.WEXITED n -> exit n
   | _ -> exit (-1)
-  | exception M.Hipp.Cycle (cmd,cmds) ->
-    let p = M.Backend.print_command in
-    Printf.eprintf "Cycle detected: %s\n"
-      (String.concat "\nis required by " (p cmd :: List.rev_map p cmds));
-    exit (-1)
 
-let command_exec input arguments = command_exec input arguments
+let command_exec input arguments = command_exec CommandMap.empty input arguments
 
 let command_exec =
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
@@ -176,7 +204,7 @@ let command_exec =
     `P "This command might get executed again later, if the result changes the target will be recomputed.";
   ] in
   Term.(pure command_exec $ pure None $ arguments),
-  Term.info "exec" ~version:"0.0.1" ~doc ~man
+  Term.info "fire" ~version:"0.0.1" ~doc ~man
 
 let commands = [command_exec]
 

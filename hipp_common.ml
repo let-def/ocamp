@@ -2,11 +2,12 @@ open Utils
 
 (* Shared constants *)
 
-let signature        = "HIPP01"
+let signature        = "OCAMP001"
 let signature_length = String.length signature
-let env_socket       = "HIPP_PATH"
-let env_key          = "HIPP_KEY"
-let env_binary       = "HIPP"
+let env_socket       = "OCAMP_PATH"
+let env_key          = "OCAMP_KEY"
+let env_binary       = "OCAMP"
+let socket_name      = ".ocamp."
 
 (* Simple engine using unix and shell as backend *)
 
@@ -17,6 +18,8 @@ module Command = struct
   }
 
   let compare (a : t) b = compare a b
+  let hash (a : t) = Hashtbl.hash a
+  let equal (a : t) b = a = b
 
   let to_string t =
     let is_special = function
@@ -121,8 +124,12 @@ module Command = struct
       (fun exn ->
         Lwt.join [Lwt_io.close input; Lwt_io.close output]
         >>= fun () -> fail exn)
+
 end
 
+module CommandMap = Map.Make (Command)
+module CommandSet = Set.Make (Command)
+module CommandHash = Hashtbl.Make (Command)
 
 (** Record the output of a process (stdout and exit status) to replay it later
     or concurrently *)
