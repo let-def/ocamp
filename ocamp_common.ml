@@ -171,6 +171,7 @@ module Result = struct
         Lwt.return (Close status)
       else
         Lwt.return (Chunk (s, Lwt.return (Close status)))
+
   let pack chunks = pack (Buffer.create 4096) chunks
 
   let fresh command heart =
@@ -191,7 +192,8 @@ module Result = struct
         result.exit_status)
 
   let equal_status t1 t2 =
-    t1 >>= fun t1 -> t2 >|= fun t2 -> t1 = t2
+    t1 >>= fun (_deps1,s1) -> t2 >|= fun (_deps2,s2) ->
+    (s1 : Unix.process_status) = s2
 
   let equal_prefix p1 s1 p2 s2 =
     let l1 = String.length s1 - p1 and l2 = String.length s2 - p2 in

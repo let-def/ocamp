@@ -6,10 +6,7 @@ module Make (P : sig
              end) =
 struct
 
-  type builder = {
-    build_func : Command.action -> Command.t -> Result.t;
-    build_heart : Heart.t;
-  }
+  type builder = Command.action -> Command.t -> Result.t
 
   let builders : builder Builder.t =
     Builder.create ()
@@ -48,8 +45,7 @@ struct
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
             let query = command.query in
-            let result = builder.build_func query.action query.request in
-            Heart.fragilize builder.build_heart [result.Result.heart];
+            let result = builder query.action query.request in
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
             status >>= fun status ->
@@ -135,27 +131,36 @@ struct
         end;
       result
 
-    let dont_record _ _ _ = ()
+    let dont_record _ _ = ()
 
-    let record deps action result command =
-      match action with
-      | `Hipp -> deps := Result.Hipp result :: !deps
-      | `Pull -> deps := Result.Pull command :: !deps
+    let record
+        build_heart build_deps
+        dep_action dep_result
+      =
+      match dep_action with
+      | `Hipp ->
+        Heart.fragilize build_heart [dep_result.Result.heart];
+        build_deps := Result.Hipp dep_result :: !build_deps
+      | `Pull ->
+        Heart.fragilize build_heart [dep_result.Result.heart];
+        build_deps := Result.Pull dep_result.Result.command :: !build_deps
       | `Stir | `Validate -> ()
 
     let is_fresh result = function
       | `Hipp | `Pull -> not (Heart.is_broken result.Result.heart)
       | `Stir -> Heart.break result.Result.heart; false
 
+    let fresh_result command heart =
+      let result = Result.fresh command heart in
+      update_cache command (fst result);
+      result
+
     let rec rebuild record_dep command =
       let build_deps = ref [] in
-      let builder = {
-        build_func = build (record build_deps);
-        build_heart = Heart.fresh ();
-      } in
-      let result, resultf = Result.fresh command builder.build_heart in
-      record_dep result command;
-      update_cache command result;
+      let build_heart = Heart.fresh () in
+      let builder = build (record build_heart build_deps) in
+      let result, resultf = fresh_result command build_heart in
+      record_dep result;
       do_execute builder result resultf build_deps command
 
     and build record_dep action command =
@@ -173,19 +178,16 @@ struct
       | (`Hipp | `Pull | `Stir) as action ->
         let record_dep = record_dep action in
         begin match CommandMap.find command !cache with
-          | result ->
-            if is_fresh result action then result
-            else if action = `Hipp then
-              refresh record_dep command result
-            else rebuild record_dep command
-          | exception Not_found ->
-            rebuild record_dep command
+          | result when is_fresh result action -> result
+          | result when action <> `Stir -> refresh record_dep command result
+          | _ -> rebuild record_dep command
+          | exception Not_found -> rebuild record_dep command
         end
 
     and refresh record_dep command result_old =
-      let heart = Heart.fresh () in
-      let result, resultf = Result.fresh command heart in
-      record_dep result command;
+      let build_heart = Heart.fresh () in
+      let result, resultf = Result.fresh command build_heart in
+      record_dep result;
       update_cache command result;
       Lwt.ignore_result
         begin
@@ -203,10 +205,7 @@ struct
           in
           let rebuild_me () =
             let build_deps = ref [] in
-            let builder = {
-              build_func = build (record build_deps);
-              build_heart = heart;
-            } in
+            let builder = build (record build_heart build_deps) in
             do_execute builder result resultf build_deps command
           in
           let rec refresh_hipps acc = function
@@ -221,6 +220,15 @@ struct
                 Lwt.return (rebuild_me ())
             | x :: xs -> refresh_hipps (x :: acc) xs
             | [] ->
+              List.iter (fun dep ->
+                  let dep_result = match dep with
+                    | Result.Hipp r -> r
+                    | Result.Pull c ->
+                      try CommandMap.find command !cache
+                      with Not_found -> assert false
+                  in
+                  Heart.fragilize build_heart [dep_result.Result.heart])
+                acc;
               result_old.Result.chunks >>= fun chunks ->
               Result.copy_chunks (List.rev acc) chunks resultf >|= fun _ ->
               result
@@ -233,10 +241,7 @@ struct
       result
 
     let entry command =
-      Builder.with_value builders {
-        build_func = build dont_record;
-        build_heart = Heart.fresh ();
-      } @@ fun key ->
+      Builder.with_value builders (build dont_record) @@ fun key ->
       let vars = Array.of_list [env_key ^ "=" ^ key] in
       let env = Array.append vars (Unix.environment ()) in
       Unix.chdir command.Command.exec_dir;
