@@ -8,7 +8,6 @@ struct
 
   type builder = {
     build_func : Command.action -> Command.t -> Result.t;
-    build_deps : Command.t list ref;
     build_heart : Heart.t;
   }
 
@@ -49,7 +48,6 @@ struct
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
             let query = command.query in
-            builder.build_deps := query.request :: !(builder.build_deps);
             let result = builder.build_func query.action query.request in
             Heart.fragilize builder.build_heart [result.Result.heart];
             Result.dump_to !(command.env.stdout) result >>= fun status ->
@@ -122,9 +120,7 @@ struct
     let update_cache command result =
       cache := CommandMap.add command result !cache
 
-    let do_execute builder command =
-      let result, resultf = Result.fresh builder.build_heart in
-      update_cache command result;
+    let do_execute builder result resultf build_deps command =
       (* Lwt_process doesn't allow specifying working directory ?! *)
       Lwt.ignore_result
         begin
@@ -135,26 +131,37 @@ struct
           let process = Lwt_process.open_process_in ~env
               (command.Command.exec_args.(0), command.Command.exec_args) in
           (* Wait for command to finish *)
-          Result.of_process builder.build_deps process resultf;
+          Result.of_process build_deps process resultf;
         end;
       result
+
+    let dont_record _ _ _ = ()
+
+    let record deps action result command =
+      match action with
+      | `Hipp -> deps := Result.Hipp result :: !deps
+      | `Pull -> deps := Result.Pull command :: !deps
+      | `Stir | `Validate -> ()
 
     let is_fresh result = function
       | `Hipp | `Pull -> not (Heart.is_broken result.Result.heart)
       | `Stir -> Heart.break result.Result.heart; false
 
-    let rec rebuild command =
+    let rec rebuild record_dep command =
+      let build_deps = ref [] in
       let builder = {
-        build_func = build;
-        build_deps = ref [];
+        build_func = build (record build_deps);
         build_heart = Heart.fresh ();
       } in
-      do_execute builder command
+      let result, resultf = Result.fresh command builder.build_heart in
+      record_dep result command;
+      update_cache command result;
+      do_execute builder result resultf build_deps command
 
-    and build action command =
+    and build record_dep action command =
       match action with
       | `Validate ->
-        let result, resultf = Result.fresh Heart.broken in
+        let result, resultf = Result.fresh command Heart.broken in
         let status = match CommandMap.find command !cache with
           | result' when Heart.is_broken result'.Result.heart -> 1
           | result' -> 0
@@ -164,22 +171,70 @@ struct
           (Result.of_status (Lwt.return ([], Unix.WEXITED status)) resultf);
         result
       | (`Hipp | `Pull | `Stir) as action ->
+        let record_dep = record_dep action in
         begin match CommandMap.find command !cache with
           | result ->
             if is_fresh result action then result
             else if action = `Hipp then
-              refresh command
-            else rebuild command
+              refresh record_dep command result
+            else rebuild record_dep command
           | exception Not_found ->
-            rebuild command
+            rebuild record_dep command
         end
 
-    and refresh command = (*FIXME*) rebuild command
+    and refresh record_dep command result_old =
+      let heart = Heart.fresh () in
+      let result, resultf = Result.fresh command heart in
+      record_dep result command;
+      update_cache command result;
+      Lwt.ignore_result
+        begin
+          result_old.Result.exit_status >>= fun (deps,status) ->
+          let is_broken =
+            (* First find a broken pull deps *)
+            List.exists (function
+                | Result.Pull c ->
+                  begin match CommandMap.find command !cache with
+                    | dep_result -> not (is_fresh dep_result `Pull)
+                    | exception Not_found -> assert false
+                  end
+                | Result.Hipp _ -> false)
+              deps
+          in
+          let rebuild_me () =
+            let build_deps = ref [] in
+            let builder = {
+              build_func = build (record build_deps);
+              build_heart = heart;
+            } in
+            do_execute builder result resultf build_deps command
+          in
+          let rec refresh_hipps acc = function
+            | Result.Hipp dep_result_old :: xs
+              when Heart.is_broken dep_result_old.Result.heart ->
+              let dep_result_new =
+                build dont_record `Hipp dep_result_old.Result.command in
+              Result.equal dep_result_old dep_result_new >>= fun is_equal ->
+              if is_equal then
+                refresh_hipps (Result.Hipp dep_result_new :: acc) xs
+              else
+                Lwt.return (rebuild_me ())
+            | x :: xs -> refresh_hipps (x :: acc) xs
+            | [] ->
+              result_old.Result.chunks >>= fun chunks ->
+              Result.copy_chunks (List.rev acc) chunks resultf >|= fun _ ->
+              result
+          in
+          if is_broken then
+            Lwt.return (rebuild_me ())
+          else
+            refresh_hipps [] deps
+        end;
+      result
 
     let entry command =
       Builder.with_value builders {
-        build_func = build;
-        build_deps = ref [];
+        build_func = build dont_record;
         build_heart = Heart.fresh ();
       } @@ fun key ->
       let vars = Array.of_list [env_key ^ "=" ^ key] in

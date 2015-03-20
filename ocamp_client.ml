@@ -134,7 +134,7 @@ let command_is_valid =
   Term.(pure run $ pure None $ arguments),
   Term.info "is-valid" ~version:"0.0.1" ~doc ~man
 
-let commands = [command_hipp; command_stir; command_is_valid]
+let commands = [command_pull; command_hipp; command_stir; command_is_valid]
 
 let main () =
   match Term.eval_choice command_hipp commands with

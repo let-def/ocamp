@@ -18,6 +18,7 @@ module Command = struct
     exec_dir: string;
     exec_args: string array
   }
+  (*let dummy = { exec_dir = ""; exec_args = [||] }*)
 
   let compare (a : t) b = compare a b
   let hash (a : t) = Hashtbl.hash a
@@ -137,17 +138,23 @@ module CommandHash = Hashtbl.Make (Command)
 (** Record the output of a process (stdout and exit status) to replay it later
     or concurrently *)
 module Result = struct
-  type status = Command.t list * Unix.process_status
-
-  type chunks =
-    | Chunk of string * chunks Lwt.t
-    | Close of status Lwt.t
 
   type t = {
+    command: Command.t;
     heart: Heart.t;
     mutable chunks: chunks Lwt.t;
     exit_status: status Lwt.t;
   }
+
+  and chunks =
+    | Chunk of string * chunks Lwt.t
+    | Close of status Lwt.t
+
+  and status = dependency list * Unix.process_status
+
+  and dependency =
+    | Pull of Command.t
+    | Hipp of t
 
   let rec pack buffer = function
     | Chunk (s, next) ->
@@ -166,13 +173,13 @@ module Result = struct
         Lwt.return (Chunk (s, Lwt.return (Close status)))
   let pack chunks = pack (Buffer.create 4096) chunks
 
-  let fresh heart =
+  let fresh command heart =
     let chunks, chunksu = Lwt.wait () in
     let rec exit_status = function
       | Chunk (_,next) -> next >>= exit_status
       | Close status -> status in
     let exit_status = chunks >>= exit_status in
-    let result = { heart; chunks; exit_status } in
+    let result = { command; heart; chunks; exit_status } in
     result, (fun ?(packed=true) chunks ->
         let pack () =
           result.exit_status >|= fun _ ->
@@ -189,7 +196,7 @@ module Result = struct
   let equal_prefix p1 s1 p2 s2 =
     let l1 = String.length s1 - p1 and l2 = String.length s2 - p2 in
     try
-      for i = 0 to min l1 l2 do
+      for i = 0 to min l1 l2 - 1 do
         if s1.[i] <> s2.[i] then
           raise Not_found
       done;
@@ -230,12 +237,23 @@ module Result = struct
   let none = of_status (Lwt.return ([], Unix.WEXITED 255))
   let ok = of_status (Lwt.return ([], Unix.WEXITED 0))
 
+  let copy_chunks deps chunks (f : ?packed:bool -> chunks Lwt.t -> status Lwt.t) =
+    let rec aux = function
+      | Close status ->
+        Lwt.return (Close (Lwt.map (fun (_,status) -> deps, status) status))
+      | Chunk (s,chunks) ->
+        chunks >>= fun chunks ->
+        Lwt.return (Chunk (s, aux chunks))
+    in
+    f ~packed:false (aux chunks)
+
   let of_process deps p (f : ?packed:bool -> chunks Lwt.t -> status Lwt.t) =
     let buffer = Bytes.to_string (Bytes.create 1024) in
     let rec aux () =
       Lwt_io.read_into p#stdout buffer 0 1024 >>= fun got ->
       if got = 0 then
-        Lwt.return (Close (Lwt.map (fun status -> !deps, status) p#close))
+        Lwt.return (Close (Lwt.map (fun status -> List.rev !deps, status)
+                             p#close))
       else
         Lwt.return (Chunk (String.sub buffer 0 got, aux ())) in
     f ~packed:true (aux ())
