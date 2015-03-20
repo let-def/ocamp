@@ -6,12 +6,14 @@ let signature        = "OCAMP001"
 let signature_length = String.length signature
 let env_socket       = "OCAMP_PATH"
 let env_key          = "OCAMP_KEY"
-let env_binary       = "OCAMP"
+let env_binary       = "ocamp"
 let socket_name      = ".ocamp."
 
 (* Simple engine using unix and shell as backend *)
 
 module Command = struct
+  type action = [`Hipp|`Stir|`Validate]
+
   type t = {
     exec_dir: string;
     exec_args: string array
@@ -45,6 +47,7 @@ module Command = struct
     key : string;
     cwd : string;
     vars : string list;
+    action : action;
     request : t;
   }
 
@@ -163,13 +166,13 @@ module Result = struct
         Lwt.return (Chunk (s, Lwt.return (Close status)))
   let pack chunks = pack (Buffer.create 4096) chunks
 
-  let fresh () =
+  let fresh heart =
     let chunks, chunksu = Lwt.wait () in
     let rec exit_status = function
       | Chunk (_,next) -> next >>= exit_status
       | Close status -> status in
     let exit_status = chunks >>= exit_status in
-    let result = { heart = Heart.fresh (); chunks; exit_status } in
+    let result = { heart; chunks; exit_status } in
     result, (fun ?(packed=true) chunks ->
         let pack () =
           result.exit_status >|= fun _ ->

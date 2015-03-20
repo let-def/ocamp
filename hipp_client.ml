@@ -5,13 +5,13 @@ module Make ( ) = struct
 
   open Command
 
-  let make_query ?(env=[]) request =
+  let make_query ?(env=[]) action request =
     let key =
       try Sys.getenv env_key
       with Not_found ->
         invalid_arg ("Client.make_command: no " ^ env_key ^ " in environment")
     in
-    { key; cwd = Sys.getcwd (); request; vars = env }
+    { key; cwd = Sys.getcwd (); action; request; vars = env }
 
   let connect_server () =
     let path =
@@ -53,8 +53,8 @@ module Make ( ) = struct
         | exn -> Lwt.fail exn)
 
 
-  let main ?env actions =
-    let query = make_query ?env actions in
+  let main ?env action command =
+    let query = make_query ?env action command in
     let status = Lwt_main.run (execute_command query) in
     exit (match status with
         | None -> (-1)
@@ -63,19 +63,19 @@ module Make ( ) = struct
         | Some (Unix.WSTOPPED n) -> (-1))
 end
 
-let main ?env actions =
+let main ?env action command =
   let module M = Make () in
-  M.main ?env actions
-
-let command_exec input arguments =
-  let exec_dir = Path.canonicalize "." in
-  let exec_args = Array.of_list arguments in
-  main {Command. exec_dir; exec_args}
+  M.main ?env action command
 
 (* Command line interface *)
 open Cmdliner
 
-let command_exec =
+let command_hipp =
+  let run input arguments =
+    let exec_dir = Path.canonicalize "." in
+    let exec_args = Array.of_list arguments in
+    main `Hipp {Command. exec_dir; exec_args}
+  in
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
   let doc = "Execute a command and memoize its result" in
   let man = [
@@ -83,11 +83,43 @@ let command_exec =
     `P "$(tname) will execute the command represented by the rest of the arguments.";
     `P "This command might get executed again later, if the result changes the target will be recomputed.";
   ] in
-  Term.(pure command_exec $ pure None $ arguments),
-  Term.info "exec" ~version:"0.0.1" ~doc ~man
+  Term.(pure run $ pure None $ arguments),
+  Term.info "hipp" ~version:"0.0.1" ~doc ~man
 
-let commands = [command_exec]
+let command_stir =
+  let run input arguments =
+    let exec_dir = Path.canonicalize "." in
+    let exec_args = Array.of_list arguments in
+    main `Stir {Command. exec_dir; exec_args}
+  in
+  let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
+  let doc = "Execute a command and memoize its result" in
+  let man = [
+    `S "DESCRIPTION";
+    `P "$(tname) will execute the command represented by the rest of the arguments.";
+    `P "This command might get executed again later, if the result changes the target will be recomputed.";
+  ] in
+  Term.(pure run $ pure None $ arguments),
+  Term.info "stir" ~version:"0.0.1" ~doc ~man
+
+let command_is_valid =
+  let run input arguments =
+    let exec_dir = Path.canonicalize "." in
+    let exec_args = Array.of_list arguments in
+    main `Validate {Command. exec_dir; exec_args}
+  in
+  let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
+  let doc = "Execute a command and memoize its result" in
+  let man = [
+    `S "DESCRIPTION";
+    `P "$(tname) will execute the command represented by the rest of the arguments.";
+    `P "This command might get executed again later, if the result changes the target will be recomputed.";
+  ] in
+  Term.(pure run $ pure None $ arguments),
+  Term.info "is-valid" ~version:"0.0.1" ~doc ~man
+
+let commands = [command_hipp; command_stir; command_is_valid]
 
 let main () =
-  match Term.eval command_exec with
+  match Term.eval_choice command_hipp commands with
   | `Error _ -> exit 1 | _ -> exit 0

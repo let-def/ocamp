@@ -7,8 +7,9 @@ module Make (P : sig
 struct
 
   type builder = {
-    build_func : [`Hipp|`Stir] -> Command.t -> Result.t;
+    build_func : Command.action -> Command.t -> Result.t;
     build_deps : Command.t list ref;
+    build_heart : Heart.t;
   }
 
   let builders : builder Builder.t =
@@ -43,13 +44,14 @@ struct
       in
       Lwt.finalize
         begin fun () ->
-          let query = command.query in
-          Builder.with_key builders query.key @@ function
+          Builder.with_key builders command.query.key @@ function
           | None ->
             write_string (env_key ^ " is not valid") !(command.env.stderr)
           | Some builder ->
+            let query = command.query in
             builder.build_deps := query.request :: !(builder.build_deps);
-            let result = builder.build_func `Hipp query.request in
+            let result = builder.build_func query.action query.request in
+            Heart.fragilize builder.build_heart [result.Result.heart];
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
             status >>= fun status ->
@@ -121,7 +123,7 @@ struct
       cache := CommandMap.add command result !cache
 
     let do_execute builder command =
-      let result, resultf = Result.fresh () in
+      let result, resultf = Result.fresh builder.build_heart in
       update_cache command result;
       (* Lwt_process doesn't allow specifying working directory ?! *)
       Lwt.ignore_result
@@ -145,17 +147,45 @@ struct
       let builder = {
         build_func = build;
         build_deps = ref [];
+        build_heart = Heart.fresh ();
       } in
       do_execute builder command
 
-    and build (action : [`Hipp|`Stir]) command =
-      match CommandMap.find command !cache with
-      | result ->
-        if is_fresh result action
-        then result
-        else rebuild command
-      | exception Not_found ->
-        rebuild command
+    and build action command =
+      match action with
+      | `Validate ->
+        let result, resultf = Result.fresh Heart.broken in
+        let status = match CommandMap.find command !cache with
+          | result' when Heart.is_broken result'.Result.heart -> 1
+          | result' -> 0
+          | exception Not_found -> 1
+        in
+        Lwt.ignore_result
+          (Result.of_status (Lwt.return ([], Unix.WEXITED status)) resultf);
+        result
+      | (`Hipp | `Stir) as action ->
+        begin match CommandMap.find command !cache with
+          | result ->
+            if is_fresh result action
+            then result
+            else rebuild command
+          | exception Not_found ->
+            rebuild command
+        end
+
+    let entry command =
+      Builder.with_value builders {
+        build_func = build;
+        build_deps = ref [];
+        build_heart = Heart.fresh ();
+      } @@ fun key ->
+      let vars = Array.of_list [env_key ^ "=" ^ key] in
+      let env = Array.append vars (Unix.environment ()) in
+      Unix.chdir command.Command.exec_dir;
+      let process = Lwt_process.open_process_none ~env
+          (command.Command.exec_args.(0), command.Command.exec_args) in
+      process#status
+
   end
 
   let join a = a >>= fun x -> x
@@ -163,14 +193,14 @@ struct
   let main command =
     let binary = Path.canonicalize Sys.executable_name in
     Unix.putenv env_binary binary;
-    let result = Backend.build `Hipp command in
-    join (Result.dump_to (Some Lwt_unix.stdout) result) >>= fun status ->
+    let result = Backend.entry command in
+    result >>= fun status ->
     begin match status with
-      | _, Unix.WEXITED n ->
+      | Unix.WEXITED n ->
         prerr_endline ("-- exited with status " ^ string_of_int n)
-      | _, Unix.WSIGNALED n ->
+      | Unix.WSIGNALED n ->
         prerr_endline ("-- killed by signal " ^ string_of_int n)
-      | _, Unix.WSTOPPED n ->
+      | Unix.WSTOPPED n ->
         prerr_endline ("-- stopped by signal " ^ string_of_int n)
     end;
     Lwt.return status
@@ -179,7 +209,7 @@ end
 (* Command line interface *)
 open Cmdliner
 
-let rec command_exec cache input arguments =
+let rec command_fire cache input arguments =
   let exec_dir = Path.canonicalize "." in
   let exec_args = Array.of_list arguments in
   let module M = Make (struct let cache = cache end) in
@@ -187,12 +217,12 @@ let rec command_exec cache input arguments =
   (*| _, Unix.WEXITED 0 ->
     ignore (read_line ());
     command_exec cache input arguments*)
-  | _, Unix.WEXITED n -> exit n
+  | Unix.WEXITED n -> exit n
   | _ -> exit (-1)
 
-let command_exec input arguments = command_exec CommandMap.empty input arguments
+let command_fire input arguments = command_fire CommandMap.empty input arguments
 
-let command_exec =
+let command_fire =
   let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
   let doc = "Execute a command and memoize its result" in
   let man = [
@@ -200,12 +230,12 @@ let command_exec =
     `P "$(tname) will execute the command represented by the rest of the arguments.";
     `P "This command might get executed again later, if the result changes the target will be recomputed.";
   ] in
-  Term.(pure command_exec $ pure None $ arguments),
+  Term.(pure command_fire $ pure None $ arguments),
   Term.info "fire" ~version:"0.0.1" ~doc ~man
 
-let commands = [command_exec]
+let commands = [command_fire]
 
 let main () =
-  match Term.eval command_exec with
+  match Term.eval command_fire with
   | `Error _ -> exit 1
   | _ -> exit 0
