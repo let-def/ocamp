@@ -1,5 +1,5 @@
 open Utils
-open Hipp_common
+open Ocamp_common
 
 module Make ( ) = struct
 
@@ -69,6 +69,22 @@ let main ?env action command =
 
 (* Command line interface *)
 open Cmdliner
+
+let command_pull =
+  let run input arguments =
+    let exec_dir = Path.canonicalize "." in
+    let exec_args = Array.of_list arguments in
+    main `Pull {Command. exec_dir; exec_args}
+  in
+  let arguments = Arg.(non_empty & pos_all string [] & info [] ~docv:"ARGS") in
+  let doc = "Execute a command and memoize its result" in
+  let man = [
+    `S "DESCRIPTION";
+    `P "$(tname) will execute the command represented by the rest of the arguments.";
+    `P "This command might get executed again later, if the result changes the target will be recomputed.";
+  ] in
+  Term.(pure run $ pure None $ arguments),
+  Term.info "pull" ~version:"0.0.1" ~doc ~man
 
 let command_hipp =
   let run input arguments =

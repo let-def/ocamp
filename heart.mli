@@ -3,6 +3,7 @@ type t
 val fresh : unit -> t
 
 val is_broken : t -> bool
+
 val break : t -> unit
 val fragilize : t -> t list -> unit
 

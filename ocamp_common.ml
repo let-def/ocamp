@@ -12,7 +12,7 @@ let socket_name      = ".ocamp."
 (* Simple engine using unix and shell as backend *)
 
 module Command = struct
-  type action = [`Hipp|`Stir|`Validate]
+  type action = [`Hipp|`Pull|`Stir|`Validate]
 
   type t = {
     exec_dir: string;

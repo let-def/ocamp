@@ -1,5 +1,5 @@
 open Utils
-open Hipp_common
+open Ocamp_common
 
 module Make (P : sig
                val cache : Result.t CommandMap.t
@@ -140,7 +140,7 @@ struct
       result
 
     let is_fresh result = function
-      | `Hipp -> not (Heart.is_broken result.Result.heart)
+      | `Hipp | `Pull -> not (Heart.is_broken result.Result.heart)
       | `Stir -> Heart.break result.Result.heart; false
 
     let rec rebuild command =
@@ -163,15 +163,18 @@ struct
         Lwt.ignore_result
           (Result.of_status (Lwt.return ([], Unix.WEXITED status)) resultf);
         result
-      | (`Hipp | `Stir) as action ->
+      | (`Hipp | `Pull | `Stir) as action ->
         begin match CommandMap.find command !cache with
           | result ->
-            if is_fresh result action
-            then result
+            if is_fresh result action then result
+            else if action = `Hipp then
+              refresh command
             else rebuild command
           | exception Not_found ->
             rebuild command
         end
+
+    and refresh command = (*FIXME*) rebuild command
 
     let entry command =
       Builder.with_value builders {
