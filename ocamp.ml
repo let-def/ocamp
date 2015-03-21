@@ -2,12 +2,12 @@ open Utils
 
 let main () =
   let is_client =
-    try ignore (Sys.getenv Ocamp_common.env_socket : string); true
+    try ignore (Sys.getenv Common.env_socket : string); true
     with Not_found -> false
   in
   if is_client then
-    Ocamp_client.main ()
+    Client.main ()
   else
-    Ocamp_server.main ()
+    Server.main ()
 
 let () = main ()
