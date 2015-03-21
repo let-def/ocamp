@@ -12,7 +12,7 @@ let socket_name      = ".ocamp."
 (* Simple engine using unix and shell as backend *)
 
 module Command = struct
-  type action = [`Hipp|`Pull|`Stir|`Validate]
+  type action = [`Hipp|`Pull|`Stir|`Validate|`Follow|`Unfollow]
 
   type t = {
     exec_dir: string;
@@ -153,7 +153,7 @@ module Result = struct
   and status = dependency list * Unix.process_status
 
   and dependency =
-    | Pull of Command.t
+    | Pull of Heart.t * Command.t
     | Hipp of t
 
   let rec pack buffer = function
