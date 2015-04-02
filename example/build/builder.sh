@@ -39,7 +39,6 @@ ocamlopt_ld_flags() {
 builder() {
   while [[ "$1" == *"="* ]]; do
     eval export "$1"
-    echo >&2 "EXPORT $1"
     shift 1
   done
   exec $ocamp hipp sh "$SELF" "$@"
@@ -57,14 +56,13 @@ cmi() {
     $OCAMLC `builder ocamlc_c_flags` -c "${TARGET}.mli"
     echo "CMI"
   elif [ -f "${TARGET}.ml" ]; then
-    echo >&2 PREFER $PREFER
     if [ "x$PREFER" = "xCMX" ]; then
       $OCAMLOPT `builder ocamlopt_c_flags` -c "${TARGET}.ml"
-      echo >&2 CMX "'$TARGET'"
+      echo >&2 CMX_CMI "'$TARGET'"
       echo "CMX"
     else
       $OCAMLC `builder ocamlc_c_flags` -c "${TARGET}.ml"
-      echo >&2 CMO "'$TARGET'"
+      echo >&2 CMO_CMI "'$TARGET'"
       echo "CMO"
     fi
   else
@@ -92,6 +90,22 @@ cmx() {
   fi
 }
 
+byte() {
+  TARGET="$1"
+  TARGET=${TARGET%.*}
+  (builder build "${TARGET}.cmo")
+  echo >&2 BYTE "'$TARGET'"
+  $OCAMLC `builder ocamlc_ld_flags` -o "${TARGET}.byte" `link_depend cmo`
+}
+
+native() {
+  TARGET="$1"
+  TARGET=${TARGET%.*}
+  (builder build "${TARGET}.cmx")
+  echo >&2 NATIVE "'$TARGET'"
+  $OCAMLOPT `builder ocamlopt_ld_flags` -o "${TARGET}.native" `link_depend cmx`
+}
+
 depend() {
   if [ -z "$1" ]; then
     ocamldep $SOURCES
@@ -100,10 +114,20 @@ depend() {
   fi
 }
 
+link_depend() {
+  # $1 = cmx or cmo
+  builder depend | while read name colon deps; do
+    for dep in $deps; do
+      echo "$dep $name";
+    done;
+  done | tsort | grep '.$1\$'
+}
+
 build() {
+  echo >&2 BUILD "$@"
   TARGET="$1"
   if [ -z "$TARGET" ]; then
-    TARGET=${MAIN}.cmx
+    TARGET=${MAIN}.byte
   fi
   DEPS=`builder depend "$TARGET"`
   for DEP in $DEPS; do
@@ -118,8 +142,11 @@ build() {
     builder cmo "$TARGET" >/dev/null
   elif [[ "$TARGET" == *".cmx" ]]; then
     builder cmx "$TARGET" >/dev/null
+  elif [[ "$TARGET" == *".byte" ]]; then
+    builder byte "$TARGET" >/dev/null
+  elif [[ "$TARGET" == *".native" ]]; then
+    builder native "$TARGET" >/dev/null
   fi
 }
 
-echo >&2 "EVAL '$@'"
 eval "$@"
