@@ -48,8 +48,8 @@ struct
             let result = builder query.action query.request in
             Result.dump_to !(command.env.stdout) result >>= fun status ->
             close_fd command.env.stdout >>= fun () ->
-            status >>= fun status ->
-            Lwt_io.write_value command.output status
+            status >>= fun (_,status) ->
+            Lwt_io.write_value command.output (status : Unix.process_status)
         end
         finish
 

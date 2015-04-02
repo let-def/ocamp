@@ -58,7 +58,10 @@ module Make ( ) = struct
     let status = Lwt_main.run (execute_command query) in
     exit (match status with
         | None -> (-1)
-        | Some (Unix.WEXITED n) -> n
+        | Some (Unix.WEXITED n) ->
+          if n <> 0 then
+            Printf.eprintf "--- %S exited with code %d\n%!" (Command.to_string command) n;
+          n
         | Some (Unix.WSIGNALED n) -> (-1)
         | Some (Unix.WSTOPPED n) -> (-1))
 end
