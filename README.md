@@ -1,4 +1,5 @@
 OCamp extends unix shells with constructions to express memoization, sharing of computations and reactive programming.
+Licensed under CC-0.
 
 # OCamp subcommands
 
