@@ -3,11 +3,11 @@ Licensed under CC0.
 
 # OCamp subcommands
 
-## fire
+## The default operation is to start a command
 
-Just wrap a unix command with "ocamp fire" to enable the extension:
+Just wrap a unix command with "ocamp" to enable the extension:
 
-    $ ocamp fire bash
+    $ ocamp bash
 
 This will spawn a new bash session where the following subcommands are enabled.
 
